@@ -8,10 +8,23 @@
 
 #include "mmhal_wlan.h"
 #include "mmdrv.h"
+
+/* This adapter owns the peer/SAE boundary, so retain its INFO diagnostics even
+ * when the rest of the Morse stack is built at the default ERROR level. */
+#ifndef MMLOG_LEVEL_OVRD
+#define MMLOG_LEVEL_OVRD 5
+#endif
 #include "mmlog.h"
 
 #include <stdatomic.h>
 #include <string.h>
+
+/* Use the native adapter logger here. PlatformIO compiles this source in a
+ * second pass that intentionally does not expose Zephyr's private include
+ * paths, while MMLOG is part of the public Morse RF boundary in both passes. */
+#define EDGEZ_RF_LOG_DBG(...) MMLOG_INF(__VA_ARGS__)
+#define EDGEZ_RF_LOG_INF(...) MMLOG_INF(__VA_ARGS__)
+#define EDGEZ_RF_LOG_WRN(...) MMLOG_WRN(__VA_ARGS__)
 
 #define EDGEZ_MORSE_TX_TRACKED_MAX 16U
 #define EDGEZ_MORSE_BEACON_MAX_LEN 768U
@@ -382,7 +395,15 @@ static int edgez_morse_set_peer_state(void *driver_ctx, uint16_t vif_id, uint16_
     {
         return (int)MMWLAN_INVALID_ARGUMENT;
     }
-    return (int)mmdrv_update_sta_state(vif_id, aid, peer_addr, states[state]);
+    const int status = (int)mmdrv_update_sta_state(
+        vif_id, aid, peer_addr, states[state]);
+    EDGEZ_RF_LOG_INF("peer state mac=%02x:%02x:%02x:%02x:%02x:%02x "
+                     "aid=%u edgez=%u morse=%u status=%d",
+                     peer_addr[0], peer_addr[1], peer_addr[2],
+                     peer_addr[3], peer_addr[4], peer_addr[5],
+                     (unsigned)aid, (unsigned)state,
+                     (unsigned)states[state], status);
+    return status;
 }
 
 static int edgez_morse_install_key(void *driver_ctx, uint16_t vif_id, uint16_t aid,
@@ -523,6 +544,20 @@ static int edgez_morse_transmit(void *driver_ctx, uint16_t vif_id,
     }
     enum mmwlan_status status = mmdrv_tx_frame(
         packet, request->frame_type == EDGEZ_UMAC_TX_MANAGEMENT);
+    if (request->frame_type == EDGEZ_UMAC_TX_MANAGEMENT)
+    {
+        const uint16_t frame_control = request->frame_length >= 2U ?
+            edgez_morse_get_le16(request->frame) : 0U;
+        const uint16_t algorithm = request->frame_length >= 30U ?
+            edgez_morse_get_le16(&request->frame[24]) : 0xffffU;
+        const uint16_t transaction = request->frame_length >= 30U ?
+            edgez_morse_get_le16(&request->frame[26]) : 0xffffU;
+        EDGEZ_RF_LOG_INF("management TX fc=0x%04x len=%u aid=%u "
+                         "alg=%u transaction=%u status=%d",
+                         frame_control, (unsigned)request->frame_length,
+                         (unsigned)request->aid, (unsigned)algorithm,
+                         (unsigned)transaction, (int)status);
+    }
     if (status != MMWLAN_SUCCESS)
     {
         (void)edgez_morse_take_tx_token(packet);
@@ -582,8 +617,17 @@ int edgez_umac_morse_dispatch_rx(struct edgez_umac *umac,
         .vif_id = metadata->vif_id,
         .decrypted = (metadata->flags & MMDRV_RX_FLAG_DECRYPTED) != 0U,
     };
-    (void)edgez_umac_morse_normalize_rx(&frame);
+    const uint16_t frame_control = frame.length >= 2U ?
+        edgez_morse_get_le16(frame.data) : 0U;
+    const bool normalized = edgez_umac_morse_normalize_rx(&frame);
     int result = edgez_umac_dispatch_rx_frame(umac, &frame);
+    EDGEZ_RF_LOG_DBG("RX fc=0x%04x type=%u subtype=%u len=%u "
+                     "freq=%u bw=%u rssi=%d normalized=%u format=%u result=%d",
+                     frame_control, (unsigned)((frame_control >> 2) & 0x03U),
+                     (unsigned)((frame_control >> 4) & 0x0fU),
+                     (unsigned)frame.length, (unsigned)frame.frequency_hz,
+                     (unsigned)frame.bandwidth_mhz, (int)frame.rssi_dbm,
+                     normalized ? 1U : 0U, (unsigned)frame.format, result);
     mmpkt_close(&view);
     mmpkt_release(packet);
     return result;
