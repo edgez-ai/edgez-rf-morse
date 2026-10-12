@@ -28,6 +28,28 @@
 
 #define EDGEZ_MORSE_TX_TRACKED_MAX 16U
 #define EDGEZ_MORSE_BEACON_MAX_LEN 768U
+#define EDGEZ_MORSE_MGMT_MAX_LEN 768U
+#define EDGEZ_MORSE_ACTION_HEADER_LEN 24U
+#define EDGEZ_MORSE_SELF_PROTECTED_CATEGORY 15U
+#define EDGEZ_MORSE_MPM_OPEN 1U
+#define EDGEZ_MORSE_MPM_CONFIRM 2U
+#define EDGEZ_MORSE_HT_CAPABILITIES_EID 45U
+#define EDGEZ_MORSE_HT_OPERATION_EID 61U
+#define EDGEZ_MORSE_VHT_CAPABILITIES_EID 191U
+#define EDGEZ_MORSE_VHT_OPERATION_EID 192U
+#define EDGEZ_MORSE_S1G_CAPABILITIES_EID 217U
+#define EDGEZ_MORSE_S1G_OPERATION_EID 232U
+#define EDGEZ_MORSE_S1G_CAPABILITIES_IE_LEN 17U
+
+/* Native S1G operation matching the HC01 join-only profile: US operating
+ * class 2, 2 MHz centred on channel 26 (915 MHz), with primary channel 25.
+ * The legacy compatibility block below carries the same fixed profile; this
+ * IE completes its translation for Linux Morse peers, whose management RX
+ * validation requires both native S1G capability and operation elements. */
+static const uint8_t edgez_morse_s1g_operation_ie[] = {
+    EDGEZ_MORSE_S1G_OPERATION_EID, 6U,
+    0x03U, 2U, 25U, 26U, 0xfcU, 0xffU,
+};
 
 struct edgez_morse_tx_tracking
 {
@@ -70,6 +92,85 @@ uint32_t edgez_rf_tx_packet_total_count(void)
 static uint16_t edgez_morse_get_le16(const uint8_t *value)
 {
     return (uint16_t)value[0] | ((uint16_t)value[1] << 8);
+}
+
+/* EdgeZ includes both legacy HT/VHT compatibility IEs and the native S1G
+ * Capabilities IE so RF backends can choose their representation.  The Morse
+ * raw-management path transmits these caller-owned frames verbatim.  Keep the
+ * native S1G IE expected by the Linux HaLow peer and remove the four legacy
+ * compatibility IEs at this vendor boundary. */
+static size_t edgez_morse_prepare_management_frame(
+    const uint8_t *input, size_t input_length,
+    uint8_t output[EDGEZ_MORSE_MGMT_MAX_LEN])
+{
+    if (input == NULL || input_length > EDGEZ_MORSE_MGMT_MAX_LEN)
+    {
+        return 0U;
+    }
+    memcpy(output, input, input_length);
+    if (input_length < EDGEZ_MORSE_ACTION_HEADER_LEN + 4U ||
+        (edgez_morse_get_le16(input) & 0x00fcU) != 0x00d0U ||
+        input[EDGEZ_MORSE_ACTION_HEADER_LEN] !=
+            EDGEZ_MORSE_SELF_PROTECTED_CATEGORY)
+    {
+        return input_length;
+    }
+
+    const uint8_t action = input[EDGEZ_MORSE_ACTION_HEADER_LEN + 1U];
+    size_t cursor;
+    if (action == EDGEZ_MORSE_MPM_OPEN)
+    {
+        cursor = EDGEZ_MORSE_ACTION_HEADER_LEN + 4U;
+    }
+    else if (action == EDGEZ_MORSE_MPM_CONFIRM)
+    {
+        cursor = EDGEZ_MORSE_ACTION_HEADER_LEN + 6U;
+    }
+    else
+    {
+        return input_length;
+    }
+
+    const size_t legacy_ie_length = 73U;
+    while (cursor + legacy_ie_length <= input_length)
+    {
+        if (output[cursor] == EDGEZ_MORSE_HT_CAPABILITIES_EID &&
+            output[cursor + 1U] == 26U &&
+            output[cursor + 28U] == EDGEZ_MORSE_HT_OPERATION_EID &&
+            output[cursor + 29U] == 22U &&
+            output[cursor + 52U] == EDGEZ_MORSE_VHT_CAPABILITIES_EID &&
+            output[cursor + 53U] == 12U &&
+            output[cursor + 66U] == EDGEZ_MORSE_VHT_OPERATION_EID &&
+            output[cursor + 67U] == 5U)
+        {
+            memmove(&output[cursor], &output[cursor + legacy_ie_length],
+                    input_length - cursor - legacy_ie_length);
+            size_t output_length = input_length - legacy_ie_length;
+            const size_t capability_end =
+                cursor + EDGEZ_MORSE_S1G_CAPABILITIES_IE_LEN;
+            if (capability_end <= output_length &&
+                output[cursor] == EDGEZ_MORSE_S1G_CAPABILITIES_EID &&
+                output[cursor + 1U] == 15U &&
+                output_length + sizeof(edgez_morse_s1g_operation_ie) <=
+                    EDGEZ_MORSE_MGMT_MAX_LEN)
+            {
+                memmove(&output[capability_end +
+                                sizeof(edgez_morse_s1g_operation_ie)],
+                        &output[capability_end],
+                        output_length - capability_end);
+                memcpy(&output[capability_end],
+                       edgez_morse_s1g_operation_ie,
+                       sizeof(edgez_morse_s1g_operation_ie));
+                output_length += sizeof(edgez_morse_s1g_operation_ie);
+            }
+            EDGEZ_RF_LOG_INF("MPM compatibility filter action=%u len=%u->%u",
+                             (unsigned)action, (unsigned)input_length,
+                             (unsigned)output_length);
+            return output_length;
+        }
+        ++cursor;
+    }
+    return input_length;
 }
 
 bool edgez_umac_morse_normalize_rx(struct edgez_umac_rx_frame *frame)
@@ -443,6 +544,9 @@ static int edgez_morse_transmit(void *driver_ctx, uint16_t vif_id,
                                 const struct edgez_umac_tx_request *request)
 {
     uint8_t packet_class;
+    uint8_t management_frame[EDGEZ_MORSE_MGMT_MAX_LEN];
+    const uint8_t *frame = request->frame;
+    size_t frame_length = request->frame_length;
     (void)driver_ctx;
 
     if (vif_id > UINT8_MAX || request->frame_length > UINT32_MAX)
@@ -452,6 +556,13 @@ static int edgez_morse_transmit(void *driver_ctx, uint16_t vif_id,
     if (request->frame_type == EDGEZ_UMAC_TX_MANAGEMENT)
     {
         packet_class = MMDRV_PKT_CLASS_MGMT;
+        frame_length = edgez_morse_prepare_management_frame(
+            request->frame, request->frame_length, management_frame);
+        if (frame_length == 0U)
+        {
+            return (int)MMWLAN_INVALID_ARGUMENT;
+        }
+        frame = management_frame;
     }
     else if (request->tid <= 7U)
     {
@@ -463,13 +574,13 @@ static int edgez_morse_transmit(void *driver_ctx, uint16_t vif_id,
     }
 
     struct mmpkt *packet = mmdrv_alloc_mmpkt_for_tx(packet_class, 0,
-                                                     (uint32_t)request->frame_length);
+                                                     (uint32_t)frame_length);
     if (packet == NULL)
     {
         return (int)MMWLAN_NO_MEM;
     }
     struct mmpktview *view = mmpkt_open(packet);
-    mmpkt_append_data(view, request->frame, (uint32_t)request->frame_length);
+    mmpkt_append_data(view, frame, (uint32_t)frame_length);
     mmpkt_close(&view);
 
     struct mmdrv_tx_metadata *metadata = mmdrv_get_tx_metadata(packet);
@@ -521,7 +632,7 @@ static int edgez_morse_transmit(void *driver_ctx, uint16_t vif_id,
     {
         MMLOG_DBG("EdgeZ raw management TX len=%lu vif=%u aid=%u tid=%u "
                   "mcs=%u bw=%u attempts=%u flags=0x%02x\n",
-                  (unsigned long)request->frame_length,
+                  (unsigned long)frame_length,
                   (unsigned)vif_id, (unsigned)request->aid,
                   (unsigned)request->tid, (unsigned)request->mcs,
                   (unsigned)request->bandwidth_mhz,
@@ -529,13 +640,12 @@ static int edgez_morse_transmit(void *driver_ctx, uint16_t vif_id,
                   (unsigned)metadata->flags);
         MMLOG_DBG("EdgeZ raw management FC=%02x%02x DA=%02x:%02x:%02x:%02x:%02x:%02x "
                   "SA=%02x:%02x:%02x:%02x:%02x:%02x alg=%02x%02x txn=%02x%02x\n",
-                  request->frame[1], request->frame[0],
-                  request->frame[4], request->frame[5], request->frame[6],
-                  request->frame[7], request->frame[8], request->frame[9],
-                  request->frame[10], request->frame[11], request->frame[12],
-                  request->frame[13], request->frame[14], request->frame[15],
-                  request->frame[25], request->frame[24],
-                  request->frame[27], request->frame[26]);
+                  frame[1], frame[0],
+                  frame[4], frame[5], frame[6],
+                  frame[7], frame[8], frame[9],
+                  frame[10], frame[11], frame[12],
+                  frame[13], frame[14], frame[15],
+                  frame[25], frame[24], frame[27], frame[26]);
     }
     if (!edgez_morse_track_tx(packet, request->token))
     {
@@ -546,15 +656,15 @@ static int edgez_morse_transmit(void *driver_ctx, uint16_t vif_id,
         packet, request->frame_type == EDGEZ_UMAC_TX_MANAGEMENT);
     if (request->frame_type == EDGEZ_UMAC_TX_MANAGEMENT)
     {
-        const uint16_t frame_control = request->frame_length >= 2U ?
-            edgez_morse_get_le16(request->frame) : 0U;
-        const uint16_t algorithm = request->frame_length >= 30U ?
-            edgez_morse_get_le16(&request->frame[24]) : 0xffffU;
-        const uint16_t transaction = request->frame_length >= 30U ?
-            edgez_morse_get_le16(&request->frame[26]) : 0xffffU;
+        const uint16_t frame_control = frame_length >= 2U ?
+            edgez_morse_get_le16(frame) : 0U;
+        const uint16_t algorithm = frame_length >= 30U ?
+            edgez_morse_get_le16(&frame[24]) : 0xffffU;
+        const uint16_t transaction = frame_length >= 30U ?
+            edgez_morse_get_le16(&frame[26]) : 0xffffU;
         EDGEZ_RF_LOG_INF("management TX fc=0x%04x len=%u aid=%u "
                          "alg=%u transaction=%u status=%d",
-                         frame_control, (unsigned)request->frame_length,
+                         frame_control, (unsigned)frame_length,
                          (unsigned)request->aid, (unsigned)algorithm,
                          (unsigned)transaction, (int)status);
     }
