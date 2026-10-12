@@ -3,6 +3,22 @@
 Apache-2.0-licensed Morse Micro backend for the vendor-neutral
 [`edgez-rf-api`](https://github.com/edgez-ai/edgez-rf-api) interface.
 
+## Layered architecture
+
+![EdgeZ Mesh four-layer architecture](docs/edgez-mesh-four-layer-architecture.png)
+
+`edgez-rf-morsemicro` is the layer-3 adapter. The EdgeZ Mesh core reaches it
+only through the Apache-2.0 `edgez-rf-api` contract; Morse packet types,
+headers, callbacks, and driver policy stay on the adapter/vendor side of that
+boundary. The adapter is Apache-2.0, but that does not relicense the separate
+Morse Micro SDK or driver in layer 4.
+
+The Morse hosted-library sources currently identify themselves as
+`GPL-3.0-or-later OR LicenseRef-MorseMicroCommercial`. Anyone distributing a
+firmware image that incorporates those objects must use a valid Morse Micro
+commercial license or independently satisfy the applicable GPL requirements.
+Always verify the exact vendor version and its file-level license notices.
+
 This repository contains only the adapter boundary:
 
 - `edgez_umac_morse_adapter.c` maps `edgez_rf_backend_ops` to `mmdrv`.
